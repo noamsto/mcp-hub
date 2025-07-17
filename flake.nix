@@ -17,16 +17,16 @@
       systems = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
 
       perSystem = {pkgs, ...}: let
-        nodejs = pkgs.nodejs_18;
+        nodejs = pkgs.nodejs;
 
         mcp-hub = pkgs.buildNpmPackage {
           pname = "mcp-hub";
-          version = "2.0.1";
+          version = "4.1.0";
           src = self;
           inherit nodejs;
 
           nativeBuildInputs = [nodejs];
-          npmDepsHash = "sha256-69kP2n71U6/2cMy68XKEXUNmz3zekRwasQpgB3vI9o0=";
+          npmDepsHash = "sha256-yWgjY7KExFB1SWZewzPdRzJ/wux1PrYWHCaoh2RTiFA=";
         };
       in {
         packages = {

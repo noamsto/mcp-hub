@@ -1,7 +1,7 @@
 import express from "express";
 import logger from "./utils/logger.js";
 import { MCPHub } from "./MCPHub.js";
-import { ClientManager } from "./utils/client-manager.js";
+import { SSEManager, EventTypes, HubState, SubscriptionTypes } from "./utils/sse-manager.js";
 import {
   router,
   registerRoute,
@@ -14,6 +14,8 @@ import {
   wrapError,
 } from "./utils/errors.js";
 import { getMarketplace } from "./marketplace.js";
+import { MCPServerEndpoint } from "./mcp/server.js";
+import { WorkspaceCacheManager } from "./utils/workspace-cache.js";
 
 const SERVER_ID = "mcp-hub";
 
@@ -21,21 +23,6 @@ const SERVER_ID = "mcp-hub";
 const app = express();
 app.use(express.json());
 app.use("/api", router);
-
-// SSE client set
-const sseClients = new Set();
-
-// Utility function to broadcast status updates
-function broadcastStatusUpdate(metadata = {}) {
-  // Send SSE event
-  broadcastEvent("server_status", {
-    ...metadata,
-    timestamp: new Date().toISOString(),
-  });
-
-  // Log standardized update message
-  logger.logUpdate(metadata);
-}
 
 // Helper to determine HTTP status code from error type
 function getStatusCode(error) {
@@ -48,90 +35,146 @@ function getStatusCode(error) {
   return 500;
 }
 
-// Broadcast capability changes through both SSE and logger
-function broadcastCapabilityChange(type, serverName, data = {}) {
-  // Send SSE event
-  broadcastEvent(`${type.toLowerCase()}_list_changed`, {
-    type,
-    server: serverName,
-    ...data,
-    timestamp: new Date().toISOString(),
-  });
-
-  // Log standardized update message
-  logger.logCapabilityChange(type, serverName, data);
-}
-
-// Send event to all SSE clients
-function broadcastEvent(event, data) {
-  sseClients.forEach((client) => {
-    client.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  });
-}
-
 let serviceManager = null;
-let clientManager = null;
 let marketplace = null;
+let mcpServerEndpoint = null;
 
 class ServiceManager {
-  constructor(config, port, watch = false, shutdownDelay = 0) {
-    this.config = config;
-    this.port = port;
-    this.shutdownDelay = shutdownDelay;
-    this.watch = watch;
+  constructor(options = {}) {
+    this.config = options.config;
+    this.port = options.port;
+    this.autoShutdown = options.autoShutdown;
+    this.shutdownDelay = options.shutdownDelay;
+    this.watch = options.watch;
     this.mcpHub = null;
     this.server = null;
+    this.sseManager = new SSEManager(options);
+    this.workspaceCache = new WorkspaceCacheManager();
+    this.state = 'starting';
+    // Connect logger to SSE manager
+    logger.setSseManager(this.sseManager);
+  }
+  isReady() {
+    return this.state === HubState.READY
+  }
+
+  getState(extraData = {}) {
+    return {
+      state: this.state,
+      server_id: SERVER_ID,
+      pid: process.pid,
+      port: this.port,
+      timestamp: new Date().toISOString(),
+      ...extraData
+    }
+  }
+
+  setState(newState, extraData) {
+    this.state = newState;
+    this.broadcastHubState(extraData);
+
+    // Emit state change event via MCPHub for MCP endpoint to sync tools
+    if (this.mcpHub) {
+      this.mcpHub.emit('hubStateChanged', { state: newState, extraData });
+    }
+  }
+
+  /**
+   * Broadcasts current hub state to all clients
+   * @private
+   */
+  broadcastHubState(extraData = {}) {
+    this.sseManager.broadcast(EventTypes.HUB_STATE, this.getState(extraData));
+  }
+
+  broadcastSubscriptionEvent(eventType, data = {}) {
+    this.sseManager.broadcast(EventTypes.SUBSCRIPTION_EVENT, {
+      type: eventType,
+      ...data
+    });
   }
 
   async initializeMCPHub() {
-    // Initialize marketplace first
+    // Initialize workspace cache first
+    logger.info("Initializing workspace cache");
+    await this.workspaceCache.initialize();
+    await this.workspaceCache.register(this.port);
+    await this.workspaceCache.startWatching();
+
+    // Setup workspace cache event handlers
+    this.workspaceCache.on('workspacesUpdated', (workspaces) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.WORKSPACES_UPDATED, { workspaces });
+    });
+
+    // Initialize marketplace second
     logger.info("Initializing marketplace catalog");
     marketplace = getMarketplace();
     await marketplace.initialize();
-    logger.info("Marketplace initialized", {
-      catalogItems: marketplace.cache.catalog.items.length,
-    });
+    logger.info(`Marketplace initialized with ${marketplace.cache.registry?.servers?.length || 0}`);
 
     // Then initialize MCP Hub
     logger.info("Initializing MCP Hub");
     this.mcpHub = new MCPHub(this.config, {
       watch: this.watch,
+      port: this.port,
       marketplace,
     });
 
-    // Set up capability change handlers before initialization
-    this.mcpHub.on("toolsChanged", ({ server, tools }) => {
-      broadcastCapabilityChange("TOOL", server, { tools });
+    // Setup event handlers
+    this.mcpHub.on("configChangeDetected", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.CONFIG_CHANGED, data)
     });
 
-    this.mcpHub.on(
-      "resourcesChanged",
-      ({ server, resources, resourceTemplates }) => {
-        broadcastCapabilityChange("RESOURCE", server, {
-          resources,
-          resourceTemplates,
-        });
-      }
-    );
-    this.mcpHub.on("promptsChanged", ({ server, prompts }) => {
-      broadcastCapabilityChange("PROMPT", server, { prompts });
+    // Setup event handlers
+    this.mcpHub.on("importantConfigChanged", (changes) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATING, { changes })
     });
+    this.mcpHub.on("importantConfigChangeHandled", (changes) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, { changes })
+    });
+
+    // Server-specific events
+    this.mcpHub.on("toolsChanged", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.TOOL_LIST_CHANGED, data)
+    });
+
+    this.mcpHub.on("resourcesChanged", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.RESOURCE_LIST_CHANGED, data)
+    });
+
+    this.mcpHub.on("promptsChanged", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.PROMPT_LIST_CHANGED, data)
+    });
+
+    // Dev mode event handlers
+    this.mcpHub.on("devServerRestarting", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATING, data);
+    });
+    this.mcpHub.on("devServerRestarted", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, data);
+    });
+
+    // Initialize MCP server endpoint
+    try {
+      mcpServerEndpoint = new MCPServerEndpoint(this.mcpHub);
+      logger.info(`Hub endpoint ready: Use \`${mcpServerEndpoint.getEndpointUrl()}\` endpoint with any other MCP clients`);
+    } catch (error) {
+      logger.error("MCP_ENDPOINT_INIT_ERROR", "Failed to initialize MCP server endpoint", {
+        error: error.message
+      }, false);
+    }
 
     await this.mcpHub.initialize();
-
-    // Initialize client manager with shutdown delay
-    clientManager = new ClientManager(this.shutdownDelay);
+    this.setState(HubState.READY)
   }
 
   async restartHub() {
     if (this.mcpHub) {
+      this.setState(HubState.RESTARTING)
       logger.info("Restarting MCP Hub");
-      await this.mcpHub.initialize(true)
+      await this.mcpHub.initialize(true);
       logger.info("MCP Hub restarted successfully");
-      broadcastStatusUpdate({
-        action: "restart",
-        timestamp: new Date().toISOString
-      })
+      this.setState(HubState.RESTARTED, { has_restarted: true })
     }
   }
 
@@ -140,26 +183,16 @@ class ServiceManager {
       logger.info(`Starting HTTP server on port ${this.port}`, {
         port: this.port,
       });
+
+      //INFO: this doesn't throw EADDRINUSE in express@v5 but is thrown inside on("error")
       this.server = app.listen(this.port, () => {
-        const serverStatuses = this.mcpHub.getAllServerStatuses();
-        // Output structured startup JSON
-        const startupInfo = {
-          status: "ready",
-          server_id: SERVER_ID,
-          port: this.port,
-          pid: process.pid,
-          servers: serverStatuses,
-          timestamp: new Date().toISOString(),
-        };
-        broadcastEvent("server_ready", startupInfo);
-        logger.info(`MCP_HUB_STARTED`, {
-          status: "ready",
-          port: this.port,
-        });
+        logger.info("HTTP_SERVER_STARTED");
         resolve();
       });
 
       this.server.on("error", (error) => {
+        this.setState(HubState.ERROR, { message: error.message, code: error.code })
+        logger.info(`HTTP_SERVER_START_ERROR: ${error.code}: ${error.message}`);
         reject(
           wrapError(error, "HTTP_SERVER_ERROR", {
             port: this.port,
@@ -208,12 +241,10 @@ class ServiceManager {
       return;
     }
 
-    logger.info("Stopping MCP Hub and disconnecting all servers");
+    logger.info("Stopping MCP Hub and cleaning up resources");
     try {
-      await this.mcpHub.disconnectAll();
-      logger.info(
-        "MCP Hub has been successfully stopped and all servers disconnected"
-      );
+      await this.mcpHub.cleanup();
+      logger.info("MCP Hub has been successfully stopped and cleaned up");
       this.mcpHub = null;
     } catch (error) {
       logger.error(
@@ -256,48 +287,85 @@ class ServiceManager {
   }
 
   async shutdown() {
+    this.setState(HubState.STOPPING)
     logger.info("Starting graceful shutdown process");
 
-    // Notify all clients before shutdown
-    broadcastEvent("server_shutdown", {
-      server_id: SERVER_ID,
-      reason: "shutdown",
-      timestamp: new Date().toISOString(),
-    });
+    // Close MCP server endpoint
+    if (mcpServerEndpoint) {
+      try {
+        await mcpServerEndpoint.close();
+        mcpServerEndpoint = null;
+      } catch (error) {
+        logger.debug(`Error closing MCP server endpoint: ${error.message}`);
+      }
+    }
 
-    // Close all SSE connections
-    sseClients.forEach((client) => client.end());
-    sseClients.clear();
-
-    await this.stopServer();
-    await this.stopMCPHub();
+    //INFO:Sometimes this might take some time, keeping the process alive, this might cause issue when restarting 
+    //INFO: MUST catch the error here to avoid unhandled rejection, which will again call shutdown() leading to infinite loop
+    this.stopServer().catch((error) => {
+      // Mostly happens when the server is already stopped (race condition)
+      logger.debug(`Error stopping HTTP server: ${error.message}`);
+    })
+    await Promise.allSettled([
+      this.stopMCPHub(),
+      this.sseManager.shutdown(),
+      this.workspaceCache.shutdown()
+    ]);
+    this.setState(HubState.STOPPED)
   }
 }
 
 // Register SSE endpoint
 registerRoute("GET", "/events", "Subscribe to server events", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
+  try {
+    if (!serviceManager?.sseManager) {
+      throw new ServerError("SSE manager not initialized");
+    }
+    // Add client connection
+    const connection = serviceManager.sseManager.addConnection(req, res);
+    // Send initial state
+    connection.send(EventTypes.HUB_STATE, serviceManager.getState());
+  } catch (error) {
+    logger.error('SSE_SETUP_ERROR', 'Failed to setup SSE connection', {
+      error: error.message,
+      stack: error.stack
+    });
 
-  // Send initial server info
-  const serverInfo = {
-    server_id: SERVER_ID,
-    status: "connected",
-    pid: process.pid,
-    port: serviceManager?.port,
-    activeClients: clientManager?.getActiveClientCount() || 0,
-    timestamp: new Date().toISOString(),
-  };
-  res.write(`event: server_info\ndata: ${JSON.stringify(serverInfo)}\n\n`);
+    // Ensure response is ended
+    if (!res.writableEnded) {
+      res.status(500).end();
+    }
+  }
+});
 
-  // Add client to set
-  sseClients.add(res);
+// Register MCP SSE endpoint
+app.get("/mcp", async (req, res) => {
+  try {
+    if (!mcpServerEndpoint) {
+      throw new ServerError("MCP server endpoint not initialized");
+    }
+    await mcpServerEndpoint.handleSSEConnection(req, res);
+  } catch (error) {
+    logger.warn(`Failed to setup MCP SSE connection: ${error.message}`)
+    if (!res.headersSent) {
+      res.status(500).send('Error establishing MCP connection');
+    }
+  }
+});
 
-  // Handle client disconnect
-  req.on("close", () => {
-    sseClients.delete(res);
-  });
+// Register MCP messages endpoint
+app.post("/messages", async (req, res) => {
+  try {
+    if (!mcpServerEndpoint) {
+      throw new ServerError("MCP server endpoint not initialized");
+    }
+    await mcpServerEndpoint.handleMCPMessage(req, res);
+  } catch (error) {
+    logger.warn('Failed to handle MCP message');
+    if (!res.headersSent) {
+      res.status(500).send('Error handling MCP message');
+    }
+  }
 });
 
 // Register marketplace endpoints
@@ -306,16 +374,16 @@ registerRoute(
   "/marketplace",
   "Get marketplace catalog with filtering and sorting",
   async (req, res) => {
+    const { search, category, tags, sort } = req.query;
     try {
-      const { search, category, tags, sort } = req.query;
-      const items = await marketplace.getCatalog({
+      const servers = await marketplace.getCatalog({
         search,
         category,
         tags: tags ? tags.split(",") : undefined,
         sort,
       });
       res.json({
-        items,
+        servers,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -331,8 +399,8 @@ registerRoute(
   "/marketplace/details",
   "Get detailed server information",
   async (req, res) => {
+    const { mcpId } = req.body;
     try {
-      const { mcpId } = req.body;
       if (!mcpId) {
         throw new ValidationError("Missing mcpId in request body");
       }
@@ -354,59 +422,23 @@ registerRoute(
   }
 );
 
-// Register client management routes
+// Register workspaces endpoint
 registerRoute(
-  "POST",
-  "/client/register",
-  "Register a new client",
-  (req, res) => {
-    const { clientId } = req.body;
-    if (!clientId) {
-      throw new ValidationError("Missing client ID", { field: "clientId" });
+  "GET",
+  "/workspaces",
+  "Get all active workspaces",
+  async (req, res) => {
+    try {
+      const workspaces = await serviceManager.workspaceCache.getActiveWorkspaces();
+      res.json({
+        workspaces,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      throw wrapError(error, "WORKSPACE_ERROR", {
+        operation: "list_workspaces",
+      });
     }
-
-    const activeClients = clientManager.registerClient(clientId);
-
-    // Notify all clients about new client
-    broadcastEvent("client_registered", {
-      activeClients,
-      clientId,
-      timestamp: new Date().toISOString(),
-    });
-
-    res.json({
-      status: "success",
-      server_id: SERVER_ID,
-      activeClients,
-      timestamp: new Date().toISOString(),
-    });
-  }
-);
-
-registerRoute(
-  "POST",
-  "/client/unregister",
-  "Unregister a client",
-  (req, res) => {
-    const { clientId } = req.body;
-    if (!clientId) {
-      throw new ValidationError("Missing client ID", { field: "clientId" });
-    }
-
-    const activeClients = clientManager.unregisterClient(clientId);
-
-    // Notify all clients about client removal
-    broadcastEvent("client_unregistered", {
-      activeClients,
-      clientId,
-      timestamp: new Date().toISOString(),
-    });
-
-    res.json({
-      status: "success",
-      activeClients,
-      timestamp: new Date().toISOString(),
-    });
   }
 );
 
@@ -416,19 +448,12 @@ registerRoute(
   "/servers/start",
   "Start a server",
   async (req, res) => {
+    const { server_name } = req.body;
     try {
-      const { server_name } = req.body;
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
       }
       const status = await serviceManager.mcpHub.startServer(server_name);
-
-      broadcastStatusUpdate({
-        action: "start",
-        server: server_name,
-        // status: status,
-      });
-
       res.json({
         status: "ok",
         server: status,
@@ -436,6 +461,12 @@ registerRoute(
       });
     } catch (error) {
       throw wrapError(error, "SERVER_START_ERROR", { server: server_name });
+    } finally {
+      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: {
+          modified: [server_name],
+        }
+      })
     }
   }
 );
@@ -446,8 +477,8 @@ registerRoute(
   "/servers/stop",
   "Stop a server",
   async (req, res) => {
+    const { server_name } = req.body;
     try {
-      const { server_name } = req.body;
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
       }
@@ -456,14 +487,6 @@ registerRoute(
         server_name,
         disable === "true"
       );
-
-      broadcastStatusUpdate({
-        action: "stop",
-        server: server_name,
-        status: status,
-        disabled: disable === "true",
-      });
-
       res.json({
         status: "ok",
         server: status,
@@ -471,19 +494,46 @@ registerRoute(
       });
     } catch (error) {
       throw wrapError(error, "SERVER_STOP_ERROR", { server: server_name });
+    } finally {
+      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: {
+          modified: [server_name],
+        }
+      })
     }
   }
 );
 
 // Register health check endpoint
-registerRoute("GET", "/health", "Check server health", (req, res) => {
-  res.json({
+registerRoute("GET", "/health", "Check server health", async (req, res) => {
+  const healthData = {
     status: "ok",
+    state: serviceManager?.state || HubState.STARTING,
     server_id: SERVER_ID,
-    activeClients: clientManager?.getActiveClientCount() || 0,
+    activeClients: serviceManager?.sseManager?.connections.size || 0,
     timestamp: new Date().toISOString(),
     servers: serviceManager?.mcpHub?.getAllServerStatuses() || [],
-  });
+    connections: serviceManager?.sseManager?.getStats() || { totalConnections: 0, connections: [] }
+  };
+
+  // Add MCP endpoint stats if available
+  if (mcpServerEndpoint) {
+    healthData.mcpEndpoint = mcpServerEndpoint.getStats();
+  }
+
+  // Add workspace information if available
+  if (serviceManager?.workspaceCache) {
+    try {
+      healthData.workspace = {
+        current: serviceManager.workspaceCache.getWorkspaceKey(),
+        allActive: await serviceManager.workspaceCache.getActiveWorkspaces()
+      };
+    } catch (error) {
+      logger.debug(`Failed to get workspace info for health check: ${error.message}`);
+    }
+  }
+
+  res.json(healthData);
 });
 
 // Register server list endpoint
@@ -506,8 +556,8 @@ registerRoute(
   "/servers/info",
   "Get status of a specific server",
   (req, res) => {
+    const { server_name } = req.body;
     try {
-      const { server_name } = req.body;
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
       }
@@ -525,10 +575,9 @@ registerRoute(
   }
 );
 
-//reloads the config file, disconnects all existing servers, and reconnects servers from the new config
+// Reloads the config file, disconnects all existing servers, and reconnects servers from the new config
 registerRoute("POST", "/restart", "Restart MCP Hub", async (req, res) => {
   try {
-    const { clientId } = req.body;
     await serviceManager.restartHub();
     res.json({
       status: "ok",
@@ -539,14 +588,33 @@ registerRoute("POST", "/restart", "Restart MCP Hub", async (req, res) => {
   }
 })
 
+// Sends a hard-restarting signal to all the clients. ON receiving clients should kill the process and start it again
+// This is needed in order to load the latest process.env
+// For usual restarts use the /restart endpoint
+registerRoute("POST", "/hard-restart", "Hard Restart MCP Hub", async (req, res) => {
+  try {
+
+    if (serviceManager.mcpHub) {
+      serviceManager.setState(HubState.RESTARTING)
+      process.emit('SIGTERM')
+    }
+    res.json({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    throw wrapError(error, "HUB_HARD_RESTART_ERROR");
+  }
+})
+
 // Register server refresh endpoint
 registerRoute(
   "POST",
   "/servers/refresh",
   "Refresh a server's capabilities",
   async (req, res) => {
+    const { server_name } = req.body;
     try {
-      const { server_name } = req.body;
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
       }
@@ -589,8 +657,8 @@ registerRoute(
   "Get a prompt from a specific server",
   async (req, res) => {
 
+    const { server_name, prompt, arguments: args, request_options } = req.body;
     try {
-      const { server_name, prompt, arguments: args } = req.body;
 
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
@@ -601,7 +669,8 @@ registerRoute(
       const result = await serviceManager.mcpHub.getPrompt(
         server_name,
         prompt,
-        args || {}
+        args || {},
+        request_options
       );
       res.json({
         result,
@@ -618,6 +687,7 @@ registerRoute(
 )
 
 
+
 // Register tool execution endpoint
 registerRoute(
   "POST",
@@ -625,8 +695,8 @@ registerRoute(
   "Execute a tool on a specific server",
   async (req, res) => {
 
+    const { server_name, tool, arguments: args, request_options } = req.body;
     try {
-      const { server_name, tool, arguments: args } = req.body;
 
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
@@ -637,7 +707,8 @@ registerRoute(
       const result = await serviceManager.mcpHub.callTool(
         server_name,
         tool,
-        args || {}
+        args || {},
+        request_options
       );
       res.json({
         result,
@@ -660,9 +731,9 @@ registerRoute(
   "Access a resource on a specific server",
   async (req, res) => {
 
+    const { server_name, uri, request_options } = req.body;
     try {
 
-      const { server_name, uri } = req.body;
       if (!server_name) {
         throw new ValidationError("Missing server name", { field: "server_name" });
       }
@@ -670,7 +741,7 @@ registerRoute(
       if (!uri) {
         throw new ValidationError("Missing resource URI", { field: "uri" });
       }
-      const result = await serviceManager.mcpHub.readResource(server_name, uri);
+      const result = await serviceManager.mcpHub.readResource(server_name, uri, request_options);
       res.json({
         result,
         timestamp: new Date().toISOString(),
@@ -684,6 +755,152 @@ registerRoute(
     }
   }
 );
+
+
+registerRoute(
+  "POST",
+  "/servers/authorize",
+  "Handles opening different kinds of uris",
+  async (req, res) => {
+    const { server_name } = req.body;
+    try {
+      if (!server_name) {
+        throw new ValidationError("Missing server name", { field: "server_name" });
+      }
+      const connection = serviceManager.mcpHub.getConnection(server_name)
+      const result = await connection.authorize()
+      res.json(result);
+    } catch (error) {
+      throw wrapError(error, "OPEN_REQUEST_ERROR", error.data || {});
+    }
+  }
+)
+
+//For cases where mcp-hub is running on a remote system and the oauth callback points to localhost
+registerRoute(
+  "POST",
+  "/oauth/manual_callback",
+  "Handle OAuth callback for manual authorization",
+  async (req, res) => {
+    let code, server_name
+    try {
+
+      const { url } = req.body || {}
+      if (!url) {
+        throw new ValidationError("Missing URL parameter", { field: "url" });
+      }
+      const url_with_code = new URL(url)
+      if (url_with_code.searchParams.has('code')) {
+        code = url_with_code.searchParams.get('code')
+      }
+      if (url_with_code.searchParams.has('server_name')) {
+        server_name = url_with_code.searchParams.get('server_name')
+      }
+      if (!code || !server_name) {
+        throw new ValidationError("Missing code or server_name parameter");
+      }
+      //simulate delay
+      // await new Promise(resolve => setTimeout(resolve, 3000));
+      const connection = serviceManager.mcpHub.getConnection(server_name);
+      await connection.handleAuthCallback(code)
+      // // Still broadcast the update for consistency
+      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: {
+          modified: [server_name],
+        }
+      });
+      return res.json({
+        status: "ok",
+        message: `Authorization successful for server '${server_name}'`,
+        server_name,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      throw wrapError(error, "MANUAL_OAUTH_CALLBACK_ERROR", {
+        url: req.body?.url || null,
+      });
+    }
+  }
+)
+registerRoute(
+  "GET",
+  "/oauth/callback",
+  "Handle OAuth callback",
+  async (req, res) => {
+    const { code, server_name } = req.query;
+
+    try {
+      if (!code || !server_name) {
+        throw new ValidationError("Missing code or server_name parameter");
+      }
+      // Send initial processing page
+      res.write(`
+        <html>
+          <head>
+            <title>MCP HUB</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+              .loader { border: 5px solid #f3f3f3; border-top: 5px solid #3498db; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 20px auto; }
+              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+              .hidden { display: none; }
+              .message { margin: 20px 0; font-size: 18px; }
+            </style>
+            <script>
+              function updateStatus(status, message) {
+                document.getElementById('processing').style.display = status === 'processing' ? 'block' : 'none';
+                document.getElementById('success').style.display = status === 'success' ? 'block' : 'none';
+                document.getElementById('error').style.display = status === 'error' ? 'block' : 'none';
+                if (message) {
+                  document.getElementById('errorMessage').textContent = message;
+                }
+              }
+            </script>
+          </head>
+          <body>
+            <div id="processing">
+              <h1>MCP HUB</h1>
+              <h2><code>${server_name}<code> Authorization Processing</h2>
+              <div class="loader"></div>
+              <p class="message">Please wait while mcp-hub completes the authorization...</p>
+            </div>
+            <div id="success" class="hidden">
+              <h1>MCP HUB</h1>
+              <h2><code>${server_name}<code> Authorization Successful</h2>
+              <p class="message">Your server has been authorized successfully!</p>
+              <p>You can close this window and return to the application.</p>
+            </div>
+            <div id="error" class="hidden">
+              <h1>MCP HUB</h1>
+              <h2><code>${server_name}<code> Authorization Failed</h2>
+              <p class="message">An error occurred during authorization:</p>
+              <p id="errorMessage" style="color: red;"></p>
+              <p class="message">For errors like 'fetch failed' (serverless hosting might take time to startup), stopping and starting the MCP Server should help. </p>
+            </div>
+          </body>
+        </html>
+      `);
+
+      const connection = serviceManager.mcpHub.getConnection(server_name);
+
+      await connection.handleAuthCallback(code)
+      res.write('<script>updateStatus("success");</script>');
+
+    } catch (error) {
+      logger.error('OAUTH_CALLBACK_ERROR', `Error during OAuth callback: ${error.message}`, {}, false)
+      res.write(`<script>updateStatus("error", "${error.message.replace(/"/g, '\\"')}");</script>`);
+    } finally {
+      // Still broadcast the update for consistency
+      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: {
+          modified: [server_name],
+        }
+      });
+      res.end();
+    }
+  }
+);
+
+
 
 // Error handler middleware
 router.use((err, req, res, next) => {
@@ -707,36 +924,36 @@ router.use((err, req, res, next) => {
 });
 
 // Start the server with options
-export async function startServer({
-  port,
-  config,
-  watch = false,
-  shutdownDelay = 0,
-} = {}) {
-  serviceManager = new ServiceManager(config, port, watch, shutdownDelay);
+export async function startServer(options = {}) {
+  serviceManager = new ServiceManager(options);
 
   try {
     serviceManager.setupSignalHandlers();
-    await serviceManager.initializeMCPHub();
+
+    // Start HTTP server first to fail fast on port conflicts
     await serviceManager.startServer();
+
+    // Then initialize MCP Hub
+    await serviceManager.initializeMCPHub();
   } catch (error) {
-    const wrappedError =
-      error.code === "EADDRINUSE"
-        ? new ServerError("Port already in use", {
-          port,
-          error: error.message,
-        })
-        : wrapError(error, "SERVER_START_ERROR");
-
-    logger.error(
-      wrappedError.code,
-      wrappedError.message,
-      wrappedError.data,
-      true,
-      error.code === "EADDRINUSE" ? 0 : 1
-    );
-
-    await serviceManager.shutdown();
+    const wrappedError = wrapError(error, error.code || "SERVER_START_ERROR");
+    try {
+      this.setState(HubState.ERROR, {
+        message: wrappedError.message,
+        code: wrappedError.code,
+        data: wrappedError.data,
+      })
+      await serviceManager.shutdown()
+    } catch (e) {
+    } finally {
+      logger.error(
+        wrappedError.code,
+        wrappedError.message,
+        wrappedError.data,
+        true,
+        1
+      );
+    }
   }
 }
 

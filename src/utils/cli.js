@@ -58,8 +58,8 @@ async function run() {
       },
       config: {
         alias: "c",
-        describe: "Path to config file",
-        type: "string",
+        describe: "Path to config file(s). Can be specified multiple times. Merged in order.",
+        type: "array",
         demandOption: true,
       },
       watch: {
@@ -68,14 +68,19 @@ async function run() {
         type: "boolean",
         default: false,
       },
+      "auto-shutdown": {
+        describe: "Whether to automatically shutdown when no clients are connected",
+        type: "boolean",
+        default: false
+      },
       "shutdown-delay": {
         describe:
-          "Delay in milliseconds before shutting down when no clients are connected",
+          "Delay in milliseconds before shutting down when auto-shutdown is enabled and no clients are connected",
         type: "number",
         default: 0,
       },
     })
-    .example("mcp-hub --port 3000 --config ./mcp-servers.json")
+    .example("mcp-hub --port 3000 --config ./global.json --config ./project.json")
     .help("h")
     .alias("h", "help")
     .fail(handleParseError).argv;
@@ -83,46 +88,14 @@ async function run() {
   try {
     await startServer({
       port: argv.port,
-      config: argv.config,
+      config: argv.config, // This will now be an array of paths
       watch: argv.watch,
+      autoShutdown: argv["auto-shutdown"],
       shutdownDelay: argv["shutdown-delay"],
     });
   } catch (error) {
-    if (isMCPHubError(error)) {
-      // Our errors are already structured, just pass them through
-      logger.error(error.code, error.message, error.data, true, 1);
-    } else if (error.code === "EADDRINUSE") {
-      // System errors with known codes get special handling
-      logger.error(
-        "PORT_IN_USE",
-        `Failed to start server: Port ${argv.port} is already in use by another process`,
-        {
-          port: argv.port,
-          error: error.message,
-        },
-        true,
-        1
-      );
-    } else if (error.code === "ENOENT") {
-      logger.error(
-        "CONFIG_NOT_FOUND",
-        `Failed to start server: Configuration file not found at path ${argv.config}`,
-        {
-          path: argv.config,
-          error: error.message,
-        },
-        true,
-        1
-      );
-    } else {
-      // For any other error, kill the process
-      process.kill(process.pid, "SIGINT");
-    }
+    process.exit(1)
   }
 }
 
-run().catch((error) => {
-  // This catch block handles errors from the run() function itself
-  // that weren't caught by the try/catch inside run()
-  process.kill(process.pid, "SIGINT");
-});
+run()
