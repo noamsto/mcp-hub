@@ -10,19 +10,20 @@ import { EventEmitter } from 'events';
  * across all workspaces on the system.
  */
 export class WorkspaceCacheManager extends EventEmitter {
-  constructor() {
+  constructor(options = {}) {
     super();
     this.cacheFilePath = path.join(getXDGDirectory('state'), 'workspaces.json');
     this.lockFilePath = this.cacheFilePath + '.lock';
     this.watcher = null;
     this.isWatching = false;
+    this.port = options.port || null;
   }
 
   /**
-   * Get the current workspace key (directory path from process.cwd())
+   * Get the current workspace key (port as string)
    */
   getWorkspaceKey() {
-    return process.cwd();
+    return this.port ? this.port.toString() : null;
   }
 
   /**
@@ -53,12 +54,25 @@ export class WorkspaceCacheManager extends EventEmitter {
   /**
    * Register this hub instance in the workspace cache
    */
-  async register(port) {
+  async register(port, configFiles = []) {
+    // Update our port reference
+    this.port = port;
     const workspaceKey = this.getWorkspaceKey();
+
+    if (!workspaceKey) {
+      throw new Error('Cannot register workspace: no port specified');
+    }
+
     const entry = {
+      cwd: process.cwd(),
+      config_files: configFiles,
       pid: process.pid,
-      port: port,
-      startTime: new Date().toISOString()
+      port: this.port,
+      startTime: new Date().toISOString(),
+      state: 'active',
+      activeConnections: 0,
+      shutdownStartedAt: null,
+      shutdownDelay: null
     };
 
     try {
@@ -68,14 +82,15 @@ export class WorkspaceCacheManager extends EventEmitter {
         await this._writeCache(cache);
       });
 
-      logger.info(`Registered workspace '${workspaceKey}' in cache`, {
-        workspaceKey,
+      logger.info(`Registered workspace on port ${port}`, {
+        port,
+        cwd: entry.cwd,
         pid: entry.pid,
-        port: entry.port
+        config_files: configFiles.length
       });
     } catch (error) {
       logger.error('WORKSPACE_CACHE_REGISTER_ERROR', `Failed to register workspace: ${error.message}`, {
-        workspaceKey,
+        port,
         error: error.message
       }, false);
       throw error;
@@ -88,6 +103,11 @@ export class WorkspaceCacheManager extends EventEmitter {
   async deregister() {
     const workspaceKey = this.getWorkspaceKey();
 
+    if (!workspaceKey) {
+      logger.debug('No workspace key available for deregistration');
+      return;
+    }
+
     try {
       await this._withLock(async () => {
         const cache = await this._readCache();
@@ -97,12 +117,13 @@ export class WorkspaceCacheManager extends EventEmitter {
         }
       });
 
-      logger.info(`Deregistered workspace '${workspaceKey}' from cache`, {
-        workspaceKey
+      logger.info(`Deregistered workspace on port ${this.port}`, {
+        port: this.port,
+        cwd: process.cwd()
       });
     } catch (error) {
       logger.error('WORKSPACE_CACHE_DEREGISTER_ERROR', `Failed to deregister workspace: ${error.message}`, {
-        workspaceKey,
+        port: this.port,
         error: error.message
       }, false);
       // Don't throw on deregister errors to avoid blocking shutdown
@@ -220,6 +241,76 @@ export class WorkspaceCacheManager extends EventEmitter {
         error: error.message
       }, false);
     }
+  }
+
+  /**
+   * Update workspace state in the cache
+   */
+  async updateWorkspaceState(port, updates) {
+    const workspaceKey = port.toString();
+
+    try {
+      await this._withLock(async () => {
+        const cache = await this._readCache();
+        if (cache[workspaceKey]) {
+          // Merge updates with existing entry
+          cache[workspaceKey] = { ...cache[workspaceKey], ...updates };
+          await this._writeCache(cache);
+
+          logger.debug(`Updated workspace state for port ${port}`, {
+            port,
+            updates
+          });
+        }
+      });
+    } catch (error) {
+      logger.error('WORKSPACE_CACHE_UPDATE_ERROR', `Failed to update workspace state: ${error.message}`, {
+        port,
+        updates,
+        error: error.message
+      }, false);
+    }
+  }
+
+  /**
+   * Mark workspace as shutting down
+   */
+  async setShutdownTimer(port, shutdownDelay) {
+    await this.updateWorkspaceState(port, {
+      state: 'shutting_down',
+      shutdownStartedAt: new Date().toISOString(),
+      shutdownDelay: shutdownDelay,
+      activeConnections: 0
+    });
+
+    logger.info(`Workspace on port ${port} entering shutdown state`, {
+      port,
+      shutdownDelay
+    });
+  }
+
+  /**
+   * Cancel shutdown timer and return to active state
+   */
+  async cancelShutdownTimer(port) {
+    await this.updateWorkspaceState(port, {
+      state: 'active',
+      shutdownStartedAt: null,
+      shutdownDelay: null
+    });
+
+    logger.info(`Workspace on port ${port} shutdown cancelled, returning to active`, {
+      port
+    });
+  }
+
+  /**
+   * Update active connections count
+   */
+  async updateActiveConnections(port, connectionCount) {
+    await this.updateWorkspaceState(port, {
+      activeConnections: connectionCount
+    });
   }
 
   /**

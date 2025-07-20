@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2025-07-20
+
+### Added
+
+- **VS Code Configuration Compatibility**: Full support for `.vscode/mcp.json` configuration format
+  - Support for `"servers"` key alongside existing `"mcpServers"` key
+  - VS Code-style environment variable syntax: `${env:VARIABLE_NAME}`
+  - VS Code predefined variables: `${workspaceFolder}`, `${userHome}`, `${pathSeparator}`, `${workspaceFolderBasename}`, `${cwd}`, `${/}`
+  - VS Code input variables via `MCP_HUB_ENV`: support for `${input:variable-id}` syntax
+  - JSON5 support for config files: comments and trailing commas now allowed
+  - Seamless migration path: existing `.vscode/mcp.json` files work directly with MCP Hub
+
+### Enhanced
+
+- **Configuration System**: Enhanced environment variable resolution with VS Code compatibility
+  - Proper priority system: predefined variables → process.env → MCP_HUB_ENV
+  - Predefined variables available for placeholder resolution but not passed to server environments
+  - Comprehensive test coverage for all VS Code variable types and scenarios
+
+## [4.1.1] - 2025-07-17
+
+### Added
+
+- **Real-time Workspace Lifecycle Tracking**: Enhanced workspace cache with detailed hub state management
+  - Workspace states: `active` (hub running with connections) and `shutting_down` (no connections, shutdown timer active)
+  - Real-time connection count tracking for all active hubs
+  - Shutdown timer information including start time and delay duration
+  - Automatic state transitions when connections are added/removed
+  - Live updates via SSE events enable immediate UI feedback on workspace changes
+
+### Enhanced
+
+- **Workspace Cache**: Extended workspace entries with lifecycle metadata
+  - Added `state`, `activeConnections`, `shutdownStartedAt`, and `shutdownDelay` fields
+  - Improved cache update methods for atomic state management
+  - Better integration between SSEManager and WorkspaceCacheManager
+
+- **SSE System**: Enhanced real-time communication
+  - SSEManager now updates workspace cache on connection changes
+  - Automatic workspace state updates when shutdown timers start/cancel
+  - Async connection handling for better cache integration
 
 ## [4.1.0] - 2025-07-15
 

@@ -48,8 +48,12 @@ class ServiceManager {
     this.watch = options.watch;
     this.mcpHub = null;
     this.server = null;
-    this.sseManager = new SSEManager(options);
-    this.workspaceCache = new WorkspaceCacheManager();
+    this.workspaceCache = new WorkspaceCacheManager(options);
+    this.sseManager = new SSEManager({
+      ...options,
+      workspaceCache: this.workspaceCache,
+      port: this.port
+    });
     this.state = 'starting';
     // Connect logger to SSE manager
     logger.setSseManager(this.sseManager);
@@ -98,7 +102,7 @@ class ServiceManager {
     // Initialize workspace cache first
     logger.info("Initializing workspace cache");
     await this.workspaceCache.initialize();
-    await this.workspaceCache.register(this.port);
+    await this.workspaceCache.register(this.port, this.config);
     await this.workspaceCache.startWatching();
 
     // Setup workspace cache event handlers
@@ -316,13 +320,13 @@ class ServiceManager {
 }
 
 // Register SSE endpoint
-registerRoute("GET", "/events", "Subscribe to server events", (req, res) => {
+registerRoute("GET", "/events", "Subscribe to server events", async (req, res) => {
   try {
     if (!serviceManager?.sseManager) {
       throw new ServerError("SSE manager not initialized");
     }
     // Add client connection
-    const connection = serviceManager.sseManager.addConnection(req, res);
+    const connection = await serviceManager.sseManager.addConnection(req, res);
     // Send initial state
     connection.send(EventTypes.HUB_STATE, serviceManager.getState());
   } catch (error) {
@@ -510,6 +514,7 @@ registerRoute("GET", "/health", "Check server health", async (req, res) => {
     status: "ok",
     state: serviceManager?.state || HubState.STARTING,
     server_id: SERVER_ID,
+    version: process.env.VERSION,
     activeClients: serviceManager?.sseManager?.connections.size || 0,
     timestamp: new Date().toISOString(),
     servers: serviceManager?.mcpHub?.getAllServerStatuses() || [],
@@ -524,7 +529,7 @@ registerRoute("GET", "/health", "Check server health", async (req, res) => {
   // Add workspace information if available
   if (serviceManager?.workspaceCache) {
     try {
-      healthData.workspace = {
+      healthData.workspaces = {
         current: serviceManager.workspaceCache.getWorkspaceKey(),
         allActive: await serviceManager.workspaceCache.getActiveWorkspaces()
       };

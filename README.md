@@ -45,6 +45,8 @@ This dual-interface approach means you can manage servers through the Hub's UI w
 | | Hot Reload | ✅ | Auto restart a MCP server on file changes with `dev` mode |
 | **Configuration** ||||
 | | `${}` Syntax | ✅ | Environment variables and command execution across all fields |
+| | VS Code Compatibility | ✅ | Support for `servers` key, `${env:}`, `${input:}`, predefined variables |
+| | JSON5 Support | ✅ | Comments and trailing commas in configuration files |
 
 ## Simplified Client Configuration
 
@@ -163,6 +165,73 @@ Options:
 
 MCP Hub uses JSON configuration files to define managed servers with **universal `${}` placeholder syntax** for environment variables and command execution.
 
+## VS Code Configuration Compatibility
+
+MCP Hub provides seamless compatibility with VS Code's `.vscode/mcp.json` configuration format, enabling you to use the same configuration files across both VS Code and MCP Hub.
+
+### Supported Features
+
+#### Server Configuration Keys
+Both `mcpServers` and `servers` keys are supported:
+
+```json
+{
+  "servers": {
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "perplexity": {
+      "command": "npx", 
+      "args": ["-y", "server-perplexity-ask"],
+      "env": {
+        "API_KEY": "${env:PERPLEXITY_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+#### Variable Substitution
+MCP Hub supports VS Code-style variable substitution:
+
+- **Environment Variables**: `${env:VARIABLE_NAME}` or `${VARIABLE_NAME}`
+- **Workspace Variables**: `${workspaceFolder}`, `${userHome}`, `${pathSeparator}`
+- **Command Execution**: `${cmd: command args}`
+
+**Supported Predefined Variables:**
+- `${workspaceFolder}` - Directory where mcp-hub is running
+- `${userHome}` - User's home directory  
+- `${pathSeparator}` - OS path separator (/ or \)
+- `${workspaceFolderBasename}` - Just the folder name
+- `${cwd}` - Alias for workspaceFolder
+- `${/}` - VS Code shorthand for pathSeparator
+
+#### VS Code Input Variables
+For `${input:}` variables used in VS Code configs, use the `MCP_HUB_ENV` environment variable:
+
+```bash
+# Set input variables globally
+export MCP_HUB_ENV='{"input:api-key":"your-secret-key","input:database-url":"postgresql://..."}'
+
+# Then use in config
+{
+  "servers": {
+    "myserver": {
+      "env": {
+        "API_KEY": "${input:api-key}"
+      }
+    }
+  }
+}
+```
+
+### Migration from VS Code
+Existing `.vscode/mcp.json` files work directly with MCP Hub. Simply point MCP Hub to your VS Code configuration:
+
+```bash
+mcp-hub --config .vscode/mcp.json --port 3000
+```
+
 ### Multiple Configuration Files
 
 MCP Hub supports loading multiple configuration files that are merged in order. This enables flexible configuration management:
@@ -185,8 +254,12 @@ mcp-hub --port 3000 --config ~/.config/mcphub/global.json --config ./.mcphub/pro
 
 ### Universal Placeholder Syntax
 
-- **`${ENV_VAR}`** - Resolves environment variables
+- **`${ENV_VAR}`** or **`${env:ENV_VAR}`** - Resolves environment variables
 - **`${cmd: command args}`** - Executes commands and uses output
+- **`${workspaceFolder}`** - Directory where mcp-hub is running
+- **`${userHome}`** - User's home directory
+- **`${pathSeparator}`** - OS path separator
+- **`${input:variable-id}`** - Resolves from MCP_HUB_ENV (VS Code compatibility)
 - **`null` or `""`** - Falls back to `process.env`
 
 ### Configuration Examples
@@ -369,6 +442,7 @@ Response:
   "status": "ok",
   "state": "ready",
   "server_id": "mcp-hub",
+  "version": "4.1.1",
   "activeClients": 2,
   "timestamp": "2024-02-20T05:55:00.000Z",
   "servers": [],
@@ -383,13 +457,19 @@ Response:
       }
     ]
   },
-  "workspace": {
-    "current": "/path/to/current/project",
+  "workspaces": {
+    "current": "40123",
     "allActive": {
-      "/path/to/project-a": {
+      "40123": {
+        "cwd": "/path/to/project-a",
+        "config_files": ["/home/user/.config/mcphub/global.json", "/path/to/project-a/.mcphub/project.json"],
         "pid": 12345,
         "port": 40123,
-        "startTime": "2025-01-01T12:00:00.000Z"
+        "startTime": "2025-01-17T10:00:00.000Z",
+        "state": "active",
+        "activeConnections": 2,
+        "shutdownStartedAt": null,
+        "shutdownDelay": null
       }
     }
   }
@@ -531,15 +611,27 @@ Response:
 ```json
 {
   "workspaces": {
-    "/path/to/project-a": {
+    "40123": {
+      "cwd": "/path/to/project-a",
+      "config_files": ["/home/user/.config/mcphub/global.json", "/path/to/project-a/.mcphub/project.json"],
       "pid": 12345,
       "port": 40123,
-      "startTime": "2025-01-01T12:00:00.000Z"
+      "startTime": "2025-01-17T10:00:00.000Z",
+      "state": "active",
+      "activeConnections": 2,
+      "shutdownStartedAt": null,
+      "shutdownDelay": null
     },
-    "/path/to/project-b": {
+    "40567": {
+      "cwd": "/path/to/project-b",
+      "config_files": ["/home/user/.config/mcphub/global.json"],
       "pid": 54321,
       "port": 40567,
-      "startTime": "2025-01-01T12:05:00.000Z"
+      "startTime": "2025-01-17T10:05:00.000Z",
+      "state": "shutting_down",
+      "activeConnections": 0,
+      "shutdownStartedAt": "2025-01-17T10:15:00.000Z",
+      "shutdownDelay": 600000
     }
   },
   "timestamp": "2024-02-20T05:55:00.000Z"
@@ -839,10 +931,16 @@ MCP Hub emits several types of events:
 {
   "type": "workspaces_updated",
   "workspaces": {
-    "/path/to/project-a": {
+    "40123": {
+      "cwd": "/path/to/project-a",
+      "config_files": ["/home/user/.config/mcphub/global.json", "/path/to/project-a/.mcphub/project.json"],
       "pid": 12345,
       "port": 40123,
-      "startTime": "2025-01-01T12:00:00.000Z"
+      "startTime": "2025-01-17T10:00:00.000Z",
+      "state": "active",
+      "activeConnections": 2,
+      "shutdownStartedAt": null,
+      "shutdownDelay": null
     }
   },
   "timestamp": "2024-02-20T05:55:00.000Z"
@@ -863,26 +961,19 @@ MCP Hub uses structured JSON logging for all events. Logs are written to both co
 - **XDG compliant**: `$XDG_STATE_HOME/mcp-hub/logs/mcp-hub.log` (typically `~/.local/state/mcp-hub/logs/mcp-hub.log`)
 - **Legacy fallback**: `~/.mcp-hub/logs/mcp-hub.log` (for backward compatibility)
 
-## Workspace Cache
-
-MCP Hub maintains a global workspace cache to track active instances across different working directories:
-
-- **Cache Location**: `$XDG_STATE_HOME/mcp-hub/workspaces.json` (typically `~/.local/state/mcp-hub/workspaces.json`)
-- **Purpose**: Prevents port conflicts and enables workspace discovery
-- **Content**: Maps workspace paths to their corresponding hub process information (PID, port, start time)
-- **Cleanup**: Automatically removes stale entries when processes are no longer running
+Example log entry:
 
 ```json
 {
   "type": "error",
-    "code": "TOOL_ERROR",
-    "message": "Failed to execute tool",
-    "data": {
-      "server": "example-server",
-      "tool": "example-tool",
-      "error": "Invalid parameters"
-    },
-    "timestamp": "2024-02-20T05:55:00.000Z"
+  "code": "TOOL_ERROR",
+  "message": "Failed to execute tool",
+  "data": {
+    "server": "example-server",
+    "tool": "example-tool",
+    "error": "Invalid parameters"
+  },
+  "timestamp": "2024-02-20T05:55:00.000Z"
 }
 ```
 
@@ -895,6 +986,43 @@ Log levels include:
 
 Logs are rotated daily and kept for 30 days by default.
 
+## Workspace Cache
+
+MCP Hub maintains a global workspace cache to track active instances across different working directories with real-time lifecycle management:
+
+- **Cache Location**: `$XDG_STATE_HOME/mcp-hub/workspaces.json` (typically `~/.local/state/mcp-hub/workspaces.json`)
+- **Purpose**: Prevents port conflicts, enables workspace discovery, and provides real-time lifecycle tracking
+- **Content**: Maps port numbers (as keys) to hub process information with detailed lifecycle state
+- **Cleanup**: Automatically removes stale entries when processes are no longer running
+
+### Cache Structure
+
+```json
+{
+  "40123": {
+    "cwd": "/path/to/project-a",
+    "config_files": ["/home/user/.config/mcphub/global.json", "/path/to/project-a/.mcphub/project.json"],
+    "pid": 12345,
+    "port": 40123,
+    "startTime": "2025-01-17T10:00:00.000Z",
+    "state": "active",
+    "activeConnections": 2,
+    "shutdownStartedAt": null,
+    "shutdownDelay": null
+  },
+  "40567": {
+    "cwd": "/path/to/project-b", 
+    "config_files": ["/home/user/.config/mcphub/global.json"],
+    "pid": 54321,
+    "port": 40567,
+    "startTime": "2025-01-17T10:05:00.000Z",
+    "state": "shutting_down",
+    "activeConnections": 0,
+    "shutdownStartedAt": "2025-01-17T10:15:00.000Z",
+    "shutdownDelay": 600000
+  }
+}
+```
 
 ## Error Handling
 
